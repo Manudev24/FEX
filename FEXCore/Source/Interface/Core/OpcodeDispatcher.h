@@ -122,6 +122,8 @@ struct DispatchTableEntry {
 
 class OpDispatchBuilder final : public IREmitter {
 public:
+  // MADEIRA hwbp: trap (#DB) before this instruction if the executing thread has an execute breakpoint on it.
+  void EmitHwBreakpointCheck(uint64_t InstAddress, int64_t EntryOffset);
   Ref GetNewJumpBlock(uint64_t RIP) {
     auto it = JumpTargets.find(RIP);
     LOGMAN_THROW_A_FMT(it != JumpTargets.end(), "Couldn't find block generated for 0x{:x}", RIP);

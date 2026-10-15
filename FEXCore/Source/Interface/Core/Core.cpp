@@ -44,6 +44,29 @@ $end_info$
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/HLE/SourcecodeResolver.h>
 #include <FEXCore/Utils/Allocator.h>
+#include <FEXCore/Core/HwBreakpoint.h>
+namespace FEXCore::HwBp {
+Registry Reg;
+static std::atomic_flag RegLock = ATOMIC_FLAG_INIT;
+void Add(uint32_t A) {
+  while (RegLock.test_and_set(std::memory_order_acquire)) {}
+  for (size_t i = 0; i < MaxEntries; ++i) {
+    if (Reg.Refs[i] && Reg.Addr[i] == A) { Reg.Refs[i]++; RegLock.clear(std::memory_order_release); return; }
+  }
+  for (size_t i = 0; i < MaxEntries; ++i) {
+    if (!Reg.Refs[i]) { Reg.Addr[i] = A; Reg.Refs[i] = 1; Reg.Count++; RegLock.clear(std::memory_order_release); return; }
+  }
+  RegLock.clear(std::memory_order_release);
+  LogMan::Msg::EFmt("[hwbp] breakpoint registry full, {:#x} not tracked", A);
+}
+void Remove(uint32_t A) {
+  while (RegLock.test_and_set(std::memory_order_acquire)) {}
+  for (size_t i = 0; i < MaxEntries; ++i) {
+    if (Reg.Refs[i] && Reg.Addr[i] == A) { if (--Reg.Refs[i] == 0) { Reg.Count--; } break; }
+  }
+  RegLock.clear(std::memory_order_release);
+}
+} // namespace FEXCore::HwBp
 #include <FEXCore/Utils/Event.h>
 #include <FEXCore/Utils/File.h>
 #include <FEXCore/Utils/LogManager.h>
@@ -1010,6 +1033,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         // side effect here and (if that behaviour is required) we should handle
         // that more explicitly later.
         Thread->OpDispatcher->FlushRegisterCache(true);
+        // MADEIRA hwbp: x86 debug-register execute breakpoints (see <FEXCore/Core/HwBreakpoint.h>).
+        if (FEXCore::HwBp::Contains(InstAddress)) {
+          Thread->OpDispatcher->EmitHwBreakpointCheck(InstAddress, InstAddress - GuestRIP);
+        }
 
         if (ExtendedDebugInfo || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);

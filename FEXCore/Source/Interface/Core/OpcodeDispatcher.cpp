@@ -1129,6 +1129,25 @@ void OpDispatchBuilder::CQOOp(OpcodeArgs) {
   StoreResultGPR(Op, Upper);
 }
 
+// MADEIRA: see the stack swap in XCHGOp. Read once per process.
+static bool MadeiraStackXchgPlain() {
+  static const bool On = [] {
+    const char* Env = getenv("MADEIRA_STACK_XCHG_PLAIN");
+    return Env && Env[0] == '1';
+  }();
+  return On;
+}
+
+static bool IsStackOperand(const X86Tables::DecodedOperand& Operand) {
+  if (Operand.IsGPRIndirect()) {
+    return Operand.Data.GPRIndirect.GPR == X86State::REG_RSP;
+  }
+  if (Operand.IsSIB()) {
+    return Operand.Data.SIB.Base == X86State::REG_RSP || Operand.Data.SIB.Index == X86State::REG_RSP;
+  }
+  return false;
+}
+
 void OpDispatchBuilder::XCHGOp(OpcodeArgs) {
   // Load both the source and the destination
   if (Op->OP == 0x90 && Op->Src[0].IsGPR() && Op->Src[0].Data.GPR.GPR == FEXCore::X86State::REG_RAX && Op->Dest.IsGPR() &&
@@ -1163,6 +1182,21 @@ void OpDispatchBuilder::XCHGOp(OpcodeArgs) {
   Ref Src = LoadSourceGPR(Op, Op->Src[0], Op->Flags, {.AllowUpperGarbage = true});
   if (DestIsMem(Op)) {
     HandledLock = (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_LOCK) != 0;
+
+    // MADEIRA (MADEIRA_STACK_XCHG_PLAIN=1, off by default): XCHG with memory is implicitly
+    // locked, so it becomes an LSE swap, and an LSE swap that crosses a 16-byte boundary takes an
+    // alignment fault on this host. Each fault is a Mach exception round trip plus an emulated swap
+    // (~1.6 ms on device). Themida's VM keeps its stack misaligned and swaps stack slots constantly
+    // (xchg [esp+N], reg): ~600 faults a second for minutes. An ESP-based operand without an FS/GS
+    // override is thread-private stack memory, which FEX already accesses without TSO
+    // (IsNonTSOReg), so a plain load + store keeps x86's single-thread result and never faults.
+    if (!IsMonoBackpatcherBlock && MadeiraStackXchgPlain() && (Op->Flags & X86Tables::DecodeFlags::FLAG_SEGMENTS) != X86Tables::DecodeFlags::FLAG_FS_PREFIX &&
+        (Op->Flags & X86Tables::DecodeFlags::FLAG_SEGMENTS) != X86Tables::DecodeFlags::FLAG_GS_PREFIX && IsStackOperand(Op->Dest)) {
+      Ref Old = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.AllowUpperGarbage = true});
+      StoreResultGPR(Op, Op->Dest, Src);
+      StoreResultGPR(Op, Op->Src[0], Old);
+      return;
+    }
 
     Ref Dest = MakeSegmentAddress(Op, Op->Dest);
     if (IsMonoBackpatcherBlock) {
@@ -5171,4 +5205,40 @@ void OpDispatchBuilder::NoExecOp(OpcodeArgs) {
 }
 
 #undef OpcodeArgs
+} // namespace FEXCore::IR
+
+// MADEIRA hwbp: see <FEXCore/Core/HwBreakpoint.h>
+namespace FEXCore::IR {
+void OpDispatchBuilder::EmitHwBreakpointCheck(uint64_t InstAddress, int64_t EntryOffset) {
+  const auto GPRSize = GetGPROpSize();
+  auto EntryBlock = GetCurrentBlock();
+  // Per-thread packed cell in CPUState (DeferredSignalRefCount, unused on Windows): low 32 bits = breakpoint 0,
+  // high 32 bits = breakpoint 1, 0 = off. Context loads only: no guest-memory access (guest-window safe).
+  auto Cell = _LoadContextGPR(OpSize::i64Bit, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+  auto CondCell = CondJump(Cell);
+  auto CheckBlock = CreateNewCodeBlockAtEnd();
+  SetTrueJumpTarget(CondCell, CheckBlock);
+  SetCurrentCodeBlock(CheckBlock);
+  StartNewBlock();
+  // Values must not cross block boundaries (block-local RA): reload the cell here.
+  auto CellC = _LoadContextGPR(OpSize::i64Bit, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+  auto Lo = _And(OpSize::i64Bit, CellC, Constant(0xffffffffULL));
+  auto Hi = _Lshr(OpSize::i64Bit, CellC, Constant(32));
+  auto EqLo = _Select(OpSize::i32Bit, OpSize::i64Bit, CondClass::EQ, Lo, Constant(static_cast<uint32_t>(InstAddress)), Constant(1), Constant(0));
+  auto EqHi = _Select(OpSize::i32Bit, OpSize::i64Bit, CondClass::EQ, Hi, Constant(static_cast<uint32_t>(InstAddress)), Constant(1), Constant(0));
+  auto Any = _Or(OpSize::i32Bit, EqLo, EqHi);
+  auto CondHit = CondJump(Any);
+  auto TrapBlock = CreateNewCodeBlockAtEnd();
+  SetTrueJumpTarget(CondHit, TrapBlock);
+  SetCurrentCodeBlock(TrapBlock);
+  StartNewBlock();
+  // Instruction breakpoints are faults: report the breakpointed instruction itself.
+  _StoreContextGPR(GPRSize, _EntrypointOffset(GPRSize, EntryOffset), offsetof(FEXCore::Core::CPUState, rip));
+  Break(FEXCore::IR::BreakDefinition {.ErrorRegister = 0, .Signal = FEXCore::Core::FAULT_SIGTRAP, .TrapNumber = FEXCore::X86State::X86_TRAPNO_DB, .si_code = 4});
+  auto NextBlock = CreateNewCodeBlockAfter(EntryBlock);
+  SetFalseJumpTarget(CondCell, NextBlock);
+  SetFalseJumpTarget(CondHit, NextBlock);
+  SetCurrentCodeBlock(NextBlock);
+  StartNewBlock();
+}
 } // namespace FEXCore::IR

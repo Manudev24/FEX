@@ -39,6 +39,7 @@ $end_info$
 #include "Common/ImageTracker.h"
 #include "Common/InvalidationTracker.h"
 #include "Common/OvercommitTracker.h"
+#include <FEXCore/Core/HwBreakpoint.h>
 #include "Common/CPUFeatures.h"
 #include "Common/Logging.h"
 #include "Common/Module.h"
@@ -269,6 +270,11 @@ struct TLS {
 
 struct FrontendThreadData {
   bool InLockedRWXRead {};
+  // MADEIRA hwbp: enabled x86 execute breakpoints (DR0-3 with DR7 L/G set and RW=00), 0 = off.
+  uint32_t HwBp[4] {};
+  bool HwBpResumeStep {};  // a one-instruction TF step is in flight to resume past a breakpoint at Eip
+  bool HwBpInternalSet {}; // BTCpuSetContext called from the exception path: no resume logic
+  uint8_t HwBpSavedTF {};
   // MADEIRA ml1430: syscall parking for the code-buffer sweeper (see IosWowSyscallC).
   // IosInSim is the sweeper's per-thread "may be executing emitted code" byte; it is 0
   // only while the thread is blocked in an outermost-level syscall whose return can be
@@ -389,6 +395,31 @@ TLS GetTLS() {
 
 FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Thread) {
   return static_cast<FrontendThreadData*>(Thread->FrontendPtr);
+}
+
+// MADEIRA hwbp helpers ---------------------------------------------------------------------
+static uint64_t* HwBpCell(FEXCore::Core::InternalThreadState* Thread) {
+  return reinterpret_cast<uint64_t*>(&Thread->CurrentFrame->State.DeferredSignalRefCount);
+}
+static void HwBpArm(FEXCore::Core::InternalThreadState* Thread, FrontendThreadData* TD, bool Arm) {
+  // Packed cell read by the JIT check: low 32 bits = DR0 breakpoint, high 32 bits = DR1 breakpoint (0 = off).
+  uint64_t V = 0;
+  if (Arm) {
+    V = static_cast<uint64_t>(TD->HwBp[0]) | (static_cast<uint64_t>(TD->HwBp[1]) << 32);
+    if (TD->HwBp[2] || TD->HwBp[3]) {
+      LogMan::Msg::EFmt("[hwbp] tid={:#x} dr2/dr3 execute breakpoints are not checked by the JIT (dr2={:#x} dr3={:#x})", GetCurrentThreadId(), TD->HwBp[2], TD->HwBp[3]);
+    }
+  }
+  *HwBpCell(Thread) = V;
+}
+static bool HwBpAt(FrontendThreadData* TD, uint32_t Eip, unsigned* Index = nullptr) {
+  for (unsigned n = 0; n < 4; ++n) {
+    if (TD->HwBp[n] && TD->HwBp[n] == Eip) {
+      if (Index) *Index = n;
+      return true;
+    }
+  }
+  return false;
 }
 
 /* MADEIRA ml1430: WOW64 SYSCALL PARKING FOR THE CODE-BUFFER SWEEPER.
@@ -1553,6 +1584,7 @@ void BTCpuThreadTerm(HANDLE Thread, LONG ExitCode) {
   if (GetFrontendThreadData(ThreadState)->IosSweepRegistered) {
     IosSweepUnregisterThread(ThreadState);
   }
+  // hwbp: registry entries are kept for the process lifetime (see HwBpUpdate).
   delete GetFrontendThreadData(ThreadState);
 
   // GDT and LDT are mirrored, only free one.
@@ -1614,6 +1646,40 @@ void* __wine_get_unix_opcode() {
  * set_thread_context drop to ~0 as well because the self fast path above then
  * engages -- together ~1180 requests/s of the measured ~3700/s.
  */
+// MADEIRA hwbp: apply the debug registers of a context carrying CONTEXT_DEBUG_REGISTERS.
+static void HwBpUpdate(FEXCore::Core::InternalThreadState* Thread, FrontendThreadData* TD, const WOW64_CONTEXT* Ctx) {
+  uint32_t New[4] {};
+  const uint32_t Dr7 = Ctx->Dr7;
+  const uint32_t Drs[4] = {Ctx->Dr0, Ctx->Dr1, Ctx->Dr2, Ctx->Dr3};
+  for (unsigned n = 0; n < 4; ++n) {
+    const bool Enabled = (Dr7 >> (2 * n)) & 3;
+    const uint32_t RW = (Dr7 >> (16 + 4 * n)) & 3;
+    if (!Enabled) continue;
+    if (RW == 0 && Drs[n]) {
+      New[n] = Drs[n];
+    } else if (RW) {
+      LogMan::Msg::EFmt("[hwbp] tid={:#x} dr{} data breakpoint rw={} at {:#x} not supported", GetCurrentThreadId(), n, RW, Drs[n]);
+    }
+  }
+  bool Changed = false;
+  for (unsigned n = 0; n < 4; ++n) {
+    if (New[n] == TD->HwBp[n]) continue;
+    Changed = true;
+    const uint32_t Old = TD->HwBp[n];
+    LogMan::Msg::EFmt("[hwbp] tid={:#x} dr{}: {:#x} -> {:#x} (dr7={:#x}, eip={:#x})", GetCurrentThreadId(), n, Old, New[n], Dr7, Ctx->Eip);
+    // Addresses stay registered for the life of the process: a block compiled while an address was
+    // unregistered would lack the (per-thread gated, cheap) check and survive the next re-arm if range
+    // invalidation misses it (seen on the iOS build: the last arm of a repeated site never fired).
+    if (New[n]) FEXCore::HwBp::Add(New[n]);
+    TD->HwBp[n] = New[n];
+    // Blocks compiled before the change lack (or carry a stale) check at these addresses.
+    std::scoped_lock Lock(ThreadCreationMutex);
+    if (Old) InvalidationTracker->InvalidateAlignedInterval(GuestWindow::ToHost(Old), 1, false);
+    if (New[n]) InvalidationTracker->InvalidateAlignedInterval(GuestWindow::ToHost(New[n]), 1, false);
+  }
+  if (Changed) HwBpArm(Thread, TD, true);
+}
+
 NTSTATUS BTCpuGetContext(HANDLE Thread, HANDLE Process, void* Unknown, WOW64_CONTEXT* Context) {
   const bool Self = Thread == GetCurrentThread();
 
@@ -1681,8 +1747,32 @@ NTSTATUS BTCpuSetContext(HANDLE Thread, HANDLE Process, void* Unknown, WOW64_CON
   }
 
   Context::LoadStateFromWowContext(TLS.ThreadState(), GetWowTEB(TLS.TEB), &TmpContext);
+
+  // MADEIRA hwbp: debug registers and resume-past-breakpoint (x86 RF) semantics.
+  {
+    auto* HwThread = TLS.ThreadState();
+    auto* TD = GetFrontendThreadData(HwThread);
+    if ((Context->ContextFlags & 0x10) && !TD->HwBpInternalSet) {
+      HwBpUpdate(HwThread, TD, Context);
+    }
+    if (!TD->HwBpInternalSet) {
+      if (HwBpAt(TD, TmpContext.Eip)) {
+        // Resuming on a breakpointed instruction executes it once: disarm, step one instruction (TF), re-arm in the trap handler.
+        TD->HwBpResumeStep = true;
+        HwBpArm(HwThread, TD, false);
+        TD->HwBpSavedTF = HwThread->CurrentFrame->State.flags[FEXCore::X86State::RFLAG_TF_RAW_LOC];
+        HwThread->CurrentFrame->State.flags[FEXCore::X86State::RFLAG_TF_RAW_LOC] = 0b01;
+        LogMan::Msg::EFmt("[hwbp] tid={:#x} resuming on breakpoint {:#x}: stepping one instruction", GetCurrentThreadId(), TmpContext.Eip);
+      } else if (TD->HwBpResumeStep) {
+        TD->HwBpResumeStep = false;
+        HwThread->CurrentFrame->State.flags[FEXCore::X86State::RFLAG_TF_RAW_LOC] = TD->HwBpSavedTF;
+        HwBpArm(HwThread, TD, true);
+      }
+    }
+  }
   return STATUS_SUCCESS;
 }
+
 
 // .seh_pushframe doesn't restore the frame pointer, so if when unwinding from RtlCaptureContext an operation is used
 // that sets SP from FP, the unwound SP value will be incorrect. Wrap RtlCaptureContext so the correct FP is immediately
@@ -1923,13 +2013,66 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
   LogMan::Msg::DFmt("pc: {:X} eip: {:X}", Context->Pc, WowContext.Eip);
 
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
+  // MADEIRA [guest-exc]: which guest instruction FEX turned into a Windows exception, and what the
+  // guest's handlers receive. Protectors (Themida) probe int3 / int 2d / icebp / privileged
+  // instructions and compare the exception record with real hardware's; this is the line that
+  // shows a mismatch.
+  const bool MadeiraGenerated = Fault.FaultToTopAndGeneratedException;
+  const auto MadeiraSignal = Fault.Signal;
+  const auto MadeiraTrapNo = Fault.TrapNo;
+  const auto MadeiraErr = Fault.err_code;
+  const auto MadeiraSiCode = Fault.si_code;
+  const uint32_t MadeiraEipBefore = WowContext.Eip;
   *Exception = FEX::Windows::HandleGuestException(Fault, *Exception, WowContext.Eip, WowContext.Eax, WowContext.Ecx);
+  if (MadeiraGenerated) {
+    const auto* Bytes = reinterpret_cast<const uint8_t*>(GuestWindow::ToHostPtr(MadeiraEipBefore));
+    LogMan::Msg::EFmt("[guest-exc] gen sig={} trap={} err={:#x} eip={:#x}->{:#x} code={:#x} addr={:#x} nparams={} p0={:#x} "
+                      "bytes={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                      MadeiraSignal, MadeiraTrapNo, MadeiraErr, MadeiraEipBefore, WowContext.Eip, Exception->ExceptionCode,
+                      reinterpret_cast<uintptr_t>(Exception->ExceptionAddress), Exception->NumberParameters,
+                      Exception->NumberParameters ? Exception->ExceptionInformation[0] : 0, Bytes[0], Bytes[1], Bytes[2], Bytes[3],
+                      Bytes[4], Bytes[5], Bytes[6], Bytes[7]);
+  }
   if (Exception->ExceptionCode == EXCEPTION_SINGLE_STEP) {
     WowContext.EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
   }
   // wow64.dll will handle adjusting PC in the dispatched context after a breakpoint
 
+  const bool DbTrap = MadeiraGenerated && MadeiraSignal == FEXCore::Core::FAULT_SIGTRAP && MadeiraTrapNo == FEXCore::X86State::X86_TRAPNO_DB;
+  const uint8_t DbSiCode = MadeiraSiCode;
+  // MADEIRA hwbp
+  auto* TD = GetFrontendThreadData(Thread);
+  WowContext.ContextFlags &= ~0x10u; // reconstructed contexts carry no debug registers: keep the CPU area's
+  if (DbTrap && DbSiCode == 2 && TD->HwBpResumeStep) {
+    // Our own one-instruction step past a breakpoint finished: re-arm and continue silently.
+    TD->HwBpResumeStep = false;
+    TD->HwBpInternalSet = true;
+    BTCpuSetContext(GetCurrentThread(), GetCurrentProcess(), nullptr, &WowContext);
+    TD->HwBpInternalSet = false;
+    Thread->CurrentFrame->State.flags[FEXCore::X86State::RFLAG_TF_RAW_LOC] = TD->HwBpSavedTF;
+    HwBpArm(Thread, TD, true);
+    LogMan::Msg::EFmt("[hwbp] tid={:#x} stepped past breakpoint, resuming at {:#x}", GetCurrentThreadId(), WowContext.Eip);
+    Context::UnlockJITContext(TLS);
+    Context::LockJITContext(TLS);
+    const auto& HwConfig = SignalDelegator->GetConfig();
+    Context->Pc = HwConfig.AbsoluteLoopTopAddressFillSRA;
+    Context->X1 = 0;
+    return true;
+  }
+  if (DbTrap && DbSiCode == 4) {
+    unsigned Index = 0;
+    HwBpAt(TD, WowContext.Eip, &Index);
+    WOW64_CONTEXT DrCtx {};
+    DrCtx.ContextFlags = WOW64_CONTEXT_DEBUG_REGISTERS;
+    RtlWow64GetThreadContext(GetCurrentThread(), &DrCtx);
+    DrCtx.Dr6 = 0xFFFF0FF0u | (1u << Index);
+    RtlWow64SetThreadContext(GetCurrentThread(), &DrCtx);
+    LogMan::Msg::EFmt("[hwbp] tid={:#x} breakpoint dr{} hit at {:#x} (dr7={:#x})", GetCurrentThreadId(), Index, WowContext.Eip, DrCtx.Dr7);
+  }
+
+  TD->HwBpInternalSet = true;
   BTCpuSetContext(GetCurrentThread(), GetCurrentProcess(), nullptr, &WowContext);
+  TD->HwBpInternalSet = false;
   Context::UnlockJITContext(TLS);
 
   // Replace the host context with one captured before JIT entry so host code can unwind

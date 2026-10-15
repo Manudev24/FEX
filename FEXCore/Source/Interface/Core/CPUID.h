@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT
 #pragma once
+#include <cstdlib>
+#include <atomic>
+#include <FEXCore/Utils/LogManager.h>
 
 #include <FEXCore/Core/CPUID.h>
 #include <FEXCore/Config/Config.h>
@@ -36,7 +39,23 @@ public:
   // if we report anything differently then applications are likely to break
   constexpr static uint64_t CACHELINE_SIZE = 64;
 
+  // MADEIRA: MADEIRA_CPUID_LOG=1 logs the first 400 CPUID calls (function, leaf, result): what a
+  // protector asks the CPU before it decides the environment is not a real one.
+  static bool MadeiraCpuidLog() {
+    static const bool On = [] { const char* E = getenv("MADEIRA_CPUID_LOG"); return E && E[0] == '1'; }();
+    return On;
+  }
   FEXCore::CPUID::FunctionResults RunFunction(uint32_t Function, uint32_t Leaf) const {
+    auto R = RunFunctionInner(Function, Leaf);
+    if (MadeiraCpuidLog()) {
+      static std::atomic<uint32_t> N {0};
+      if (N.fetch_add(1) < 400) {
+        LogMan::Msg::EFmt("[cpuid] fn={:#x} leaf={:#x} -> eax={:08x} ebx={:08x} ecx={:08x} edx={:08x}", Function, Leaf, R.eax, R.ebx, R.ecx, R.edx);
+      }
+    }
+    return R;
+  }
+  FEXCore::CPUID::FunctionResults RunFunctionInner(uint32_t Function, uint32_t Leaf) const {
     if (Function < Primary.size()) {
       const auto Handler = Primary[Function];
       return (this->*Handler)(Leaf);

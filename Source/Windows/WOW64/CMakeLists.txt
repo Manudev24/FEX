@@ -35,6 +35,7 @@ target_link_libraries(wow64fex PRIVATE
 if (FEX_IOS_HOST_BUILD)
   target_link_options(wow64fex PRIVATE -static)
 else()
+  target_sources(wow64fex PRIVATE IosStubs.cpp)
   target_link_options(wow64fex PRIVATE -static -nostdlib -nostartfiles -nodefaultlibs -lc++ -lc++abi -lunwind)
   target_link_libraries(wow64fex PRIVATE ${LIBGCC_PATH})
 endif()

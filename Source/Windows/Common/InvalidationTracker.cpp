@@ -57,7 +57,14 @@ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const s
   , Threads {Threads} {
 #endif
   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
-  SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
+  // MADEIRA: with full checks every block validates its own bytes before it runs, so trapping
+  // writes to RWX pages (a fault, an invalidation and a recompile per write) adds nothing but
+  // cost. Themida's VM keeps its context on the same pages as its handlers: ~2,500 traps a
+  // second with mtrack, each one recompiling the handler page.
+  SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE || SMCChecks == FEXCore::Config::CONFIG_SMC_FULL);
+  if (SMCChecks == FEXCore::Config::CONFIG_SMC_FULL) {
+    LogMan::Msg::EFmt("[smc] FEX_SMCCHECKS=full: RWX pages are never trapped; blocks validate their bytes at entry");
+  }
 
   MEMORY_BASIC_INFORMATION Info;
   uint64_t Address = 0;
